@@ -1,0 +1,545 @@
+#Script for locating quadrats using Hough Transformation
+#Provided by Andrew, Adapted by Nate 
+#11/18/2025
+
+library(lidR)
+library(tidyverse)
+library(ggforce)
+library(rgl)
+library(sp)    # used for point-in-polygon (lightweight) 
+
+# Read in LAS files (your provided paths)
+CHT_17_TLS <- readLAS("Y:/ABOR_TLS/2025/Scans/ABOR_grads/Understory_Processing/Good alignment/TLS/ABOR_Kaibab_CHT_17_25_registered.laz")
+CHT_17_MLS <- readLAS("Y:/ABOR_TLS/2025/Scans/ABOR_grads/Understory_Processing/Good alignment/MLS/ABOR_Kaibab_CHT_17_25_MLS.laz")
+
+# --- Oriented square fit + helpers ---------------------------------------
+
+# Fit an oriented bounding box (PCA) and return center, size, and angle
+# Modified to allow any square size (no hard size_range check)
+square_fit_ls <- function(xy, min_pts = 1, aspect_tol = 0.25) {
+  # xy: two-column matrix/data.frame of X, Y coordinates
+  if (nrow(xy) < min_pts) return(NULL)
+  mu <- colMeans(xy)
+  pc <- prcomp(xy, center = TRUE, scale. = FALSE)
+  rot <- pc$rotation
+  coords_rot <- sweep(as.matrix(xy), 2, mu) %*% rot
+  bbox_rot <- apply(coords_rot, 2, range)
+  width <- bbox_rot[2,1] - bbox_rot[1,1]
+  height <- bbox_rot[2,2] - bbox_rot[1,2]
+  size <- mean(c(width, height))
+  # aspect tolerance: width and height must be similar (<= aspect_tol * size)
+  if (abs(width - height) > aspect_tol * size) return(NULL)
+  center_rot <- c((bbox_rot[1,1] + bbox_rot[2,1]) / 2, (bbox_rot[1,2] + bbox_rot[2,2]) / 2)
+  center_orig <- as.vector(mu + rot %*% center_rot)
+  angle <- atan2(rot[2,1], rot[1,1]) # radians
+  list(center = center_orig, size = size, angle = angle, width = width, height = height)
+}
+
+# Return 4 corners (matrix with columns X, Y) of rotated square given center, size, angle
+rotated_square_corners <- function(center, size, angle) {
+  half <- size / 2
+  local <- matrix(c(-half, -half,
+                    half, -half,
+                    half,  half,
+                    -half,  half), ncol = 2, byrow = TRUE)
+  R <- matrix(c(cos(angle), -sin(angle), sin(angle), cos(angle)), ncol = 2)
+  corners <- t( t(local %*% t(R)) + center )
+  colnames(corners) <- c("X","Y")
+  corners
+}
+
+# Clip LAS by rotated square (returns LAS or NULL)
+clip_las_by_rotated_square <- function(las_obj, center, size, angle) {
+  coords <- as.matrix(las_obj@data[, c("X","Y")])
+  Rneg <- matrix(c(cos(angle),  sin(angle),
+                   -sin(angle), cos(angle)), ncol = 2) # rotate by -angle
+  local <- sweep(coords, 2, center) %*% Rneg
+  half <- size / 2
+  idx <- which(abs(local[,1]) <= half & abs(local[,2]) <= half)
+  if (length(idx) == 0) return(NULL)
+  LAS(las_obj@data[idx, , drop = FALSE], header = las_obj@header)
+}
+
+# NEW: Clip LAS by convex-hull polygon (hull_xy: Nx2 matrix of vertices)
+clip_las_by_hull <- function(las_obj, hull_xy) {
+  if (is.null(hull_xy) || nrow(hull_xy) < 3) return(NULL)
+  coords <- as.matrix(las_obj@data[, c("X","Y")])
+  pip <- sp::point.in.polygon(point.x = coords[,1], point.y = coords[,2],
+                              pol.x = hull_xy[,1], pol.y = hull_xy[,2])
+  idx <- which(pip != 0) # 1 inside, 2 boundary, 3 vertex
+  if (length(idx) == 0) return(NULL)
+  LAS(las_obj@data[idx, , drop = FALSE], header = las_obj@header)
+}
+
+# --- Filter MLS to points with Intensity > 30,000 --------------------------
+
+if (is.null(CHT_17_MLS) || is.empty(CHT_17_MLS)) stop("CHT_17_MLS is empty or failed to load")
+
+# Verify Intensity field exists
+if (!("Intensity" %in% names(CHT_17_MLS@data))) {
+  stop("No 'Intensity' field found in CHT_17_MLS point table. Available fields: ",
+       paste(names(CHT_17_MLS@data), collapse = ", "))
+}
+
+message("Filtering MLS points with Intensity > 30000")
+
+# Preferred: use filter_poi (exported in recent lidR)
+if ("filter_poi" %in% ls("package:lidR")) {
+  CHT_17_MLS_filt <- filter_poi(CHT_17_MLS, Intensity > 30000)
+} else {
+  # Fallback robust method: subset the data and rebuild LAS
+  idx <- which(!is.na(CHT_17_MLS@data$Intensity) & CHT_17_MLS@data$Intensity > 30000)
+  CHT_17_MLS_filt <- LAS(CHT_17_MLS@data[idx, , drop = FALSE], header = CHT_17_MLS@header)
+}
+
+if (is.empty(CHT_17_MLS_filt)) stop("No points left after Intensity filtering on MLS")
+
+# --- Connected components on the filtered MLS to find candidate shapes ----
+
+# smaller res helps capture thin rails; keep your chosen res (1 implies coarse, adjust as needed)
+CHT_17_MLS_filt <- connected_components(CHT_17_MLS_filt, res = 0.2, min_pts = 5, name = "Component")
+df <- as.data.frame(CHT_17_MLS_filt@data)
+
+# --- Fit squares only per component (allow any square size) ----------------
+
+shapes <- list()
+
+for (cid in unique(df$Component)) {
+  component_points <- df[df$Component == cid, ]  # Get all points in the component
+  pts <- component_points[, c("X", "Y")]         # Extract X and Y coordinates
+  
+  if (nrow(pts) < 10) next  # Skip very small components
+  
+  square <- square_fit_ls(pts)  # Fit an oriented square (any size)
+  if (is.null(square)) next
+  
+  # Calculate fitting error for the square (in rotated frame)
+  cx <- square$center[1]; cy <- square$center[2]; s <- square$size / 2
+  angle <- square$angle
+  Rneg <- matrix(c(cos(angle),  sin(angle),
+                   -sin(angle), cos(angle)), ncol = 2)
+  local_pts <- sweep(as.matrix(pts), 2, square$center) %*% Rneg
+  res_square <- mean(pmin(
+    abs(local_pts[,1] - (-s)),
+    abs(local_pts[,1] - ( s)),
+    abs(local_pts[,2] - (-s)),
+    abs(local_pts[,2] - ( s))
+  )^2)
+  raw_error_square <- sqrt(res_square)
+  error_square_pct <- (raw_error_square / square$size) * 100
+  votes_square <- sum(abs(local_pts[,1]) <= s & abs(local_pts[,2]) <= s)
+  
+  # Compute representative Z using points near the square area (in rotated frame)
+  all_coords <- as.matrix(component_points[, c("X","Y")])
+  local_all <- sweep(all_coords, 2, square$center) %*% Rneg
+  inside_idx <- which(abs(local_all[,1]) <= s & abs(local_all[,2]) <= s)
+  square_z_points <- if (length(inside_idx) > 0) component_points$Z[inside_idx] else component_points$Z
+  z_value <- mean(square_z_points)
+  
+  # NEW: compute convex hull of the component points and store polygon
+  ch_idx <- chull(component_points$X, component_points$Y)
+  hull_xy_raw <- as.matrix(component_points[c(ch_idx), c("X","Y")])
+  # FORCED: replace hull with the fitted square polygon (4 corners) to ensure square clipping
+  hull_xy <- rotated_square_corners(square$center, square$size, square$angle)
+  # ensure polygon ring order is consistent (no duplicate closing point required for point.in.polygon)
+  
+  shape <- tibble(type = "square",
+                  center_x = square$center[1],
+                  center_y = square$center[2],
+                  size = square$size,
+                  angle = square$angle,
+                  z = z_value,
+                  raw_error = raw_error_square,
+                  error_pct = error_square_pct,
+                  votes = votes_square,
+                  hull_xy = list(hull_xy))
+  
+  shapes[[length(shapes) + 1]] <- shape
+}
+
+# Ensure shapes_df has expected columns even if empty
+shapes_df <- if (length(shapes) == 0) {
+  tibble(type = character(),
+         center_x = double(),
+         center_y = double(),
+         size = double(),
+         angle = double(),
+         z = double(),
+         raw_error = double(),
+         error_pct = double(),
+         votes = integer(),
+         hull_xy = list())
+} else {
+  bind_rows(shapes)
+}
+print(shapes_df)
+
+# --- Plot detected squares on 2D scatter (with hull polygons) --------------
+
+df_plot <- df
+p <- ggplot(df_plot, aes(X, Y)) +
+  geom_point(size = 0.4, alpha = 0.5)
+
+if (nrow(shapes_df) > 0) {
+  # Build a polygon dataframe for all hulls (now square corners)
+  poly_list <- list()
+  for (i in seq_len(nrow(shapes_df))) {
+    s <- shapes_df[i, ]
+    hull_xy <- do.call(rbind, s$hull_xy)
+    hull_df <- as.data.frame(hull_xy)
+    colnames(hull_df) <- c("X","Y")
+    hull_df$group <- i
+    hull_df$order <- seq_len(nrow(hull_df))
+    poly_list[[i]] <- hull_df
+  }
+  poly_df <- bind_rows(poly_list)
+  p <- p + geom_polygon(data = poly_df, aes(X, Y, group = group), color = "blue", fill = NA)
+  p <- p + geom_text(data = shapes_df, aes(x = center_x, y = center_y, label = paste0(round(size,2), " m")), inherit.aes = FALSE)
+}
+
+p <- p + coord_equal() + theme_minimal() + ggtitle("Detected hulls FORCED square corners (MLS filtered by Intensity > 30000)")
+print(p)
+
+# --- 3D plot: hull polygons ---------------------------------------------
+
+open3d()
+points3d(df$X, df$Y, df$Z, col = "gray", size = 3, alpha = 0.5)
+
+if (nrow(shapes_df) > 0) {
+  for (i in seq_len(nrow(shapes_df))) {
+    s <- shapes_df[i, ]
+    hull_xy <- do.call(rbind, s$hull_xy)
+    verts <- rbind(hull_xy, hull_xy[1, , drop = FALSE])
+    zlev <- s$z
+    lines3d(verts[,1], verts[,2], rep(zlev, nrow(verts)), col = "blue", lwd = 2)
+  }
+}
+
+axes3d()
+title3d("3D Detected Square Hulls (MLS filtered by Intensity > 30000)", xlab = "X", ylab = "Y", zlab = "Z")
+
+# --- Clip points within detected HULLS for both scans and write outputs ---
+
+# Prepare output folder
+out_folder <- "Q:/ABOR_TLS/2025/Scans/Understory Aligned/Good alignment/Quadrats"
+if (!dir.exists(out_folder)) dir.create(out_folder, recursive = TRUE)
+
+squares_df <- dplyr::filter(shapes_df, .data$type == "square")
+if (nrow(squares_df) == 0) {
+  message("No square shapes detected; no clipping will be performed.")
+} else {
+  # For each scan (TLS and MLS) clip to union of all detected hull polygons (now squares)
+  scans <- list(TLS = CHT_17_TLS, MLS = CHT_17_MLS)
+  for (scan_name in names(scans)) {
+    las_in <- scans[[scan_name]]
+    clipped_list <- list()
+    for (j in seq_len(nrow(squares_df))) {
+      hull_xy <- do.call(rbind, squares_df$hull_xy[[j]])
+      clipped_part <- clip_las_by_hull(las_in, hull_xy)
+      if (!is.null(clipped_part) && !is.empty(clipped_part)) clipped_list[[length(clipped_list) + 1]] <- clipped_part
+    }
+    if (length(clipped_list) == 0) {
+      message("No points clipped for scan ", scan_name)
+      next
+    }
+    merged_clipped <- do.call(rbind, clipped_list)
+    out_path <- file.path(out_folder, paste0("CHT_17_", scan_name, "_quadrats_hull.laz"))
+    writeLAS(merged_clipped, out_path)
+    message("Wrote clipped quadrat points for ", scan_name, " to: ", out_path)
+  }
+}
+
+# End of script
+
+
+
+# detect_quadrats_axis_with_tilt_option.R
+# Axis-aligned clipping script with optional plane-aligned (tilted) clipping.
+# Set tilt_clip = TRUE to clip perpendicular to the fitted quadrat plane;
+# set tilt_clip = FALSE to clip by axis-aligned XY bounding box of the fitted square. 
+#
+# Edit file paths and tuning at top, then run. 
+#
+library(lidR)
+library(tidyverse)
+library(ggforce)
+library(rgl)
+library(sp)
+
+# ---- User paths (edit) -----------------------------------------------------
+CHT_17_TLS <- readLAS("Y:/ABOR_TLS/2025/Scans/ABOR_grads/Understory_Processing/Good alignment/TLS/ABOR_Kaibab_CHT_17_25_registered.laz")
+CHT_17_MLS <- readLAS("Y:/ABOR_TLS/2025/Scans/ABOR_grads/Understory_Processing/Good alignment/MLS/ABOR_Kaibab_CHT_17_25_MLS.laz")
+out_folder <- "Q:/ABOR_TLS/2025/Scans/Understory Aligned/Good alignment/Quadrats"
+dir.create(out_folder, recursive = TRUE, showWarnings = FALSE)
+
+# ---- Read LAS ---------------------------------------------------------------
+CHT_17_TLS <- readLAS(tls_path)
+CHT_17_MLS <- readLAS(mls_path)
+if (is.null(CHT_17_MLS) || is.empty(CHT_17_MLS)) stop("CHT_17_MLS is empty or failed to load")
+if (is.null(CHT_17_TLS) || is.empty(CHT_17_TLS)) stop("CHT_17_TLS is empty or failed to load")
+
+# ---- Mode:  choose tilt or axis-aligned clipping -----------------------------
+tilt_clip <- TRUE   # TRUE = clip perpendicular to quadrat plane; FALSE = axis-aligned bbox
+
+# ---- Tuning (adjust for your data) -----------------------------------------
+intensity_cut <- 30000
+conn_res <- 0.1
+conn_min_pts <- 5
+min_pts_component <- 10
+aspect_tol <- 0.40
+error_pct_max <- 40
+buffer_clip <- 0.02
+size_percentile <- 0.95  # NEW: use 95th percentile for size estimation (adjust 0.90-0.98)
+
+# ---- Helper functions ------------------------------------------------------
+square_fit_ls <- function(xy, min_pts = 1, aspect_tol = 0.25, size_pct = 0.95) {
+  if (nrow(xy) < min_pts) return(NULL)
+  mu <- colMeans(xy)
+  pc <- prcomp(xy, center = TRUE, scale.  = FALSE)
+  rot <- pc$rotation
+  coords_rot <- sweep(as.matrix(xy), 2, mu) %*% rot
+  bbox_rot <- apply(coords_rot, 2, range)
+  width <- bbox_rot[2,1] - bbox_rot[1,1]
+  height <- bbox_rot[2,2] - bbox_rot[1,2]
+  
+  # CHANGED: Use percentile-based size estimation instead of mean
+  # This accounts for outliers and gives a better fit to the bulk of points
+  abs_x <- abs(coords_rot[,1])
+  abs_y <- abs(coords_rot[,2])
+  width_pct <- 2 * quantile(abs_x, probs = size_pct, na.rm = TRUE)
+  height_pct <- 2 * quantile(abs_y, probs = size_pct, na.rm = TRUE)
+  
+  # Use the larger of bbox or percentile estimates
+  width_final <- max(width, width_pct)
+  height_final <- max(height, height_pct)
+  size <- max(width_final, height_final)  # CHANGED: use max instead of mean
+  
+  if (size <= 0) return(NULL)
+  if (abs(width_final - height_final) > aspect_tol * size) return(NULL)
+  
+  center_rot <- c((bbox_rot[1,1] + bbox_rot[2,1]) / 2, (bbox_rot[1,2] + bbox_rot[2,2]) / 2)
+  center_orig <- as.vector(mu + rot %*% center_rot)
+  angle <- atan2(rot[2,1], rot[1,1])
+  list(center = center_orig, size = size, angle = angle, width = width_final, height = height_final)
+}
+
+rotated_square_corners <- function(center, size, angle) {
+  half <- size / 2
+  local <- matrix(c(-half, -half,
+                    half, -half,
+                    half,  half,
+                    -half,  half), ncol = 2, byrow = TRUE)
+  R <- matrix(c(cos(angle), -sin(angle), sin(angle), cos(angle)), ncol = 2)
+  corners <- t( t(local %*% t(R)) + center )
+  colnames(corners) <- c("X","Y")
+  corners
+}
+
+# Rotate points so the best-fit plane for xyz is horizontal.
+rotate_points_to_plane <- function(xyz) {
+  mat <- as.matrix(xyz)
+  mu3 <- colMeans(mat)
+  Xc <- sweep(mat, 2, mu3)
+  sv <- svd(Xc, nu = 3, nv = 3)
+  basis <- sv$v
+  R <- t(basis)
+  coords_rot <- t(R %*% t(Xc))
+  list(R = R, invR = t(R), center3 = mu3, xyz_rot = coords_rot,
+       xy = coords_rot[,1:2, drop = FALSE], z = coords_rot[,3])
+}
+
+# Clip LAS by a square defined in rotated plane frame (keeps ALL points inside)
+clip_las_by_square_on_plane <- function(las_obj, center3, R, sq_center_rot, size, buffer = 0) {
+  coords <- as.matrix(las_obj@data[, c("X", "Y", "Z")])
+  coords_centered <- sweep(coords, 2, center3)
+  coords_rot <- t(R %*% t(coords_centered))
+  local <- sweep(coords_rot[,1:2, drop = FALSE], 2, sq_center_rot)
+  half <- size / 2 + buffer
+  idx <- which(abs(local[,1]) <= half & abs(local[,2]) <= half)
+  if (length(idx) == 0) return(NULL)
+  LAS(las_obj@data[idx, , drop = FALSE], header = las_obj@header)
+}
+
+# Axis-aligned rectangle clip helper
+clip_rectangle <- function(las_obj, xmin, xmax, ymin, ymax) {
+  coords <- as.data.frame(las_obj@data[, c("X","Y")])
+  idx <- which(coords$X >= xmin & coords$X <= xmax & coords$Y >= ymin & coords$Y <= ymax)
+  if (length(idx) == 0) return(NULL)
+  LAS(las_obj@data[idx, , drop = FALSE], header = las_obj@header)
+}
+
+# ---- Candidate detection on MLS (intensity filtering) ----------------------
+if (! ("Intensity" %in% names(CHT_17_MLS@data))) stop("No 'Intensity' field found in MLS.  Aborting detection.")
+message("Filtering MLS points with Intensity >", intensity_cut)
+if ("filter_poi" %in% ls("package:lidR")) {
+  CHT_17_MLS_filt <- filter_poi(CHT_17_MLS, Intensity > intensity_cut)
+} else {
+  idx_i <- which(! is.na(CHT_17_MLS@data$Intensity) & CHT_17_MLS@data$Intensity > intensity_cut)
+  CHT_17_MLS_filt <- LAS(CHT_17_MLS@data[idx_i, , drop = FALSE], header = CHT_17_MLS@header)
+}
+if (is.empty(CHT_17_MLS_filt)) stop("No points left after Intensity filtering on MLS")
+CHT_17_MLS_filt <- connected_components(CHT_17_MLS_filt, res = conn_res, min_pts = conn_min_pts, name = "Component")
+df <- as.data.frame(CHT_17_MLS_filt@data)
+
+# ---- Per-component processing:  plane fit -> rotate -> 2D square fit ----------
+shapes <- list()
+for (cid in unique(df$Component)) {
+  component_points <- df[df$Component == cid, ]
+  if (nrow(component_points) < min_pts_component) next
+  
+  comp_xyz <- as.matrix(component_points[, c("X","Y","Z")])
+  # If tilt clipping is enabled, fit plane and rotate; otherwise we still rotate to help PCA (optional)
+  rot_res <- rotate_points_to_plane(comp_xyz)
+  rxy <- rot_res$xy
+  
+  # CHANGED: Pass size_percentile parameter
+  sq <- square_fit_ls(rxy, min_pts = 6, aspect_tol = aspect_tol, size_pct = size_percentile)
+  if (is.null(sq)) next
+  
+  # compute fit error in rotated frame
+  angle <- sq$angle
+  Rneg <- matrix(c(cos(angle),  sin(angle), -sin(angle), cos(angle)), ncol = 2)
+  local_pts <- sweep(as.matrix(rxy), 2, sq$center) %*% Rneg
+  half <- sq$size / 2
+  raw_err <- mean(pmin(
+    abs(local_pts[,1] - (-half)),
+    abs(local_pts[,1] - ( half)),
+    abs(local_pts[,2] - (-half)),
+    abs(local_pts[,2] - ( half))
+  )^2)
+  raw_error_square <- sqrt(raw_err)
+  error_pct <- (raw_error_square / sq$size) * 100
+  votes <- sum(abs(local_pts[,1]) <= half & abs(local_pts[,2]) <= half)
+  
+  # CHANGED: Relax error check slightly since we're fitting larger boxes
+  if (error_pct > error_pct_max * 1.2) next  # Allow 20% more error
+  
+  inside_idx <- which(abs(local_pts[,1]) <= half & abs(local_pts[,2]) <= half)
+  z_value <- if (length(inside_idx) > 0) median(rot_res$z[inside_idx], na.rm = TRUE) else median(rot_res$z, na.rm = TRUE)
+  
+  # compute rotated 2D corners, then map them back to original 3D and extract XY for plotting/axis bbox
+  corners_rot_xy <- rotated_square_corners(sq$center, sq$size, sq$angle)
+  corners_rot_3d <- cbind(corners_rot_xy, z_value)
+  invR <- rot_res$invR
+  corners_orig3 <- t(invR %*% t(corners_rot_3d)) + matrix(rot_res$center3, nrow = nrow(corners_rot_3d), ncol = 3, byrow = TRUE)
+  corners_orig_xy <- corners_orig3[, 1:2, drop = FALSE]
+  
+  shape <- tibble(
+    type = "square",
+    component = cid,
+    center3 = list(rot_res$center3),    # needed for tilted clipping
+    R = list(rot_res$R),                # rotation original -> rotated
+    sq_center_rot = list(sq$center),    # square center in rotated frame
+    size = sq$size,
+    angle = sq$angle,
+    z = z_value,
+    raw_error = raw_error_square,
+    error_pct = error_pct,
+    votes = votes,
+    corners_xy = list(corners_orig_xy)
+  )
+  shapes[[length(shapes) + 1]] <- shape
+}
+
+shapes_df <- if (length(shapes) == 0) {
+  tibble(type = character(), component = integer(), center3 = list(), R = list(), sq_center_rot = list(),
+         size = double(), angle = double(), z = double(), raw_error = double(), error_pct = double(),
+         votes = integer(), corners_xy = list())
+} else {
+  bind_rows(shapes)
+}
+print(shapes_df)
+
+# ---- Plot detected squares (original XY) ----------------------------------
+df_plot <- df
+p <- ggplot(df_plot, aes(X, Y)) +
+  geom_point(size = 0.35, alpha = 0.45) + coord_equal() + theme_minimal() +
+  ggtitle("Detected quadrat fits (original XY)")
+
+if (nrow(shapes_df) > 0) {
+  poly_list <- list()
+  for (i in seq_len(nrow(shapes_df))) {
+    hull_raw <- shapes_df$corners_xy[[i]]
+    if (is.list(hull_raw) && !is.data.frame(hull_raw)) {
+      hull_mat <- tryCatch(do.call(rbind, hull_raw), error = function(e) NULL)
+      if (is.null(hull_mat)) hull_mat <- as.matrix(as.data.frame(hull_raw))
+    } else {
+      hull_mat <- as.matrix(hull_raw)
+    }
+    if (is.null(hull_mat) || nrow(hull_mat) < 3) next
+    hull_df <- as.data.frame(hull_mat)
+    colnames(hull_df) <- c("X","Y")
+    hull_df$group <- i
+    hull_df$order <- seq_len(nrow(hull_df))
+    poly_list[[length(poly_list) + 1]] <- hull_df
+  }
+  if (length(poly_list) > 0) {
+    poly_df <- bind_rows(poly_list)
+    p <- p + geom_polygon(data = poly_df, aes(X, Y, group = group), color = "blue", fill = NA, linewidth = 1)
+  }
+}
+print(p)
+
+# ---- 3D preview of square corners (optional) -------------------------------
+open3d()
+pts_all <- as.data.frame(CHT_17_MLS@data)
+points3d(pts_all$X, pts_all$Y, pts_all$Z, col = "gray", size = 2, alpha = 0.35)
+if (nrow(shapes_df) > 0) {
+  for (i in seq_len(nrow(shapes_df))) {
+    hull_raw <- shapes_df$corners_xy[[i]]
+    if (is.list(hull_raw) && !is.data.frame(hull_raw)) {
+      hull_mat <- tryCatch(do.call(rbind, hull_raw), error = function(e) NULL)
+      if (is.null(hull_mat)) hull_mat <- as.matrix(as.data.frame(hull_mat))
+    } else {
+      hull_mat <- as.matrix(hull_raw)
+    }
+    if (is.null(hull_mat) || nrow(hull_mat) < 3) next
+    verts <- rbind(hull_mat, hull_mat[1, , drop = FALSE])
+    zlev <- shapes_df$z[i]
+    lines3d(verts[,1], verts[,2], rep(zlev, nrow(verts)), col = "blue", lwd = 3)
+  }
+}
+axes3d()
+title3d("3D Detected Quadrats (corners projected to original space)", xlab = "X", ylab = "Y", zlab = "Z")
+
+# ---- Clip ALL points (TLS & MLS) for each fitted square ---------------------
+if (nrow(shapes_df) == 0) {
+  message("No fitted squares detected; nothing to clip.")
+} else {
+  scans <- list(TLS = CHT_17_TLS, MLS = CHT_17_MLS)
+  for (scan_name in names(scans)) {
+    las_in <- scans[[scan_name]]
+    clipped_list <- list()
+    for (j in seq_len(nrow(shapes_df))) {
+      if (tilt_clip) {
+        # plane-perpendicular clipping:  use stored center3, R, sq_center_rot
+        center3 <- unlist(shapes_df$center3[[j]])
+        R <- shapes_df$R[[j]]
+        sq_center_rot <- unlist(shapes_df$sq_center_rot[[j]])
+        size <- shapes_df$size[j]
+        clipped_part <- clip_las_by_square_on_plane(las_in, center3, R, sq_center_rot, size, buffer_clip)
+      } else {
+        # axis-aligned XY bounding rectangle of the fitted square corners
+        corners_xy <- as.matrix(shapes_df$corners_xy[[j]])
+        if (is.null(corners_xy) || nrow(corners_xy) < 3) next
+        xmin <- min(corners_xy[,1], na.rm = TRUE)
+        xmax <- max(corners_xy[,1], na.rm = TRUE)
+        ymin <- min(corners_xy[,2], na.rm = TRUE)
+        ymax <- max(corners_xy[,2], na.rm = TRUE)
+        clipped_part <- clip_rectangle(las_in, xmin, xmax, ymin, ymax)
+      }
+      if (! is.null(clipped_part) && ! is.empty(clipped_part)) clipped_list[[length(clipped_list) + 1]] <- clipped_part
+    }
+    if (length(clipped_list) == 0) {
+      message("No points clipped for scan ", scan_name)
+      next
+    }
+    merged_clipped <- do.call(rbind, clipped_list)
+    out_suffix <- if (tilt_clip) "plane_clipped" else "axis_clip"
+    out_path <- file.path(out_folder, paste0("CHT_17_", scan_name, "_quadrats_", out_suffix, ". laz"))
+    writeLAS(merged_clipped, out_path)
+    message("Wrote clipped quadrat points for ", scan_name, " to: ", out_path)
+  }
+}
+
+# ---- End -------------------------------------------------------------------
