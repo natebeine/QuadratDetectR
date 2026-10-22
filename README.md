@@ -2,11 +2,13 @@
 
 `QuadratFindR` locates 1 m² quadrats in ground-based LiDAR point clouds by using the reflective tape placed around each quadrat as a visual and geometric marker. The general workflow is:
 
+This workflow was developed using data from piñon-juniper woodland plots sampled as part of [Nate Beine's master's thesis](https://www.proquest.com/docview/3344191296?pq-origsite=gscholar&fromopenview=true&sourcetype=Dissertations%20&%20Theses).
+
 1. **Load the LiDAR point cloud**  
    The script reads a TLS or MLS point cloud containing the surveyed ground surface and any reflective quadrat markers.
 
 2. **Identify reflective tape returns**  
-   Reflective tape produces distinctive, high-intensity returns in the LiDAR data. The point cloud is filtered to retain points that are likely to belong to the tape rather than vegetation, soil, or other objects.
+   Reflective tape produces distinctive, high-intensity returns in the LiDAR data. The point cloud is filtered to retain points that are likely to belong to the tape rather than vegetation, soil, or other background features.
 
    <!-- Optional image: show the original point cloud with the reflective tape returns highlighted. -->
    <!-- Suggested filename: docs/images/01-reflective-tape-returns.png -->
@@ -15,7 +17,7 @@
    The remaining points are grouped spatially so that returns belonging to the same physical quadrat are treated as a single candidate. Small, isolated groups can be removed as noise.
 
    <!-- Optional image: show candidate reflective-tape point clusters before fitting. -->
-   <!-- Suggested filename: "O:/Project_Data/nsb254/ERI_Job/Misc_Lidar_screenshots\Quadrat_findR_blue_quads.jpeg"g -->
+   ![Candidate reflective-tape point clusters before fitting](docs/images/Quadrat_findR_blue_quads.jpeg)
 
 4. **Fit a square to each candidate**  
    For each candidate group, the script estimates the quadrat's position, orientation, and dimensions. A fitted square is then drawn around the detected tape points. In diagnostic plots, these fitted squares are shown in blue.
@@ -28,13 +30,13 @@
    ![Blue fitted squares around identified quadrats](docs/images/03-blue-fitted-squares.png)
 
 5. **Check the fitted quadrats**  
-   The fitted squares can be inspected to confirm that they align with the reflective tape and represent the intended 1 m² quadrats. This step is useful for identifying false detections, overlapping candidates, or quadrats with incomplete returns.
+   The fitted squares can be inspected to confirm that they align with the reflective tape and represent the intended 1 m² quadrats. This step is useful for identifying false detections, overlapping quadrats, or poor-quality fits.
 
    <!-- Optional image: show a correctly fitted square and an example of an incorrect or rejected fit. -->
    <!-- Suggested filename: docs/images/04-fit-quality-check.png -->
 
 6. **Extract points within each quadrat**  
-   Once the quadrat boundaries have been identified, the script selects the LiDAR points inside each 1 m² square. These extracted points can then be saved or used for downstream analyses of vegetation structure, ground cover, biomass, or other plot-level measurements.
+   Once the quadrat boundaries have been identified, the script selects the LiDAR points inside each 1 m² square. These extracted points can then be saved or used for downstream analyses of vegetation structure and composition.
 
    <!-- Optional image: show the final isolated point cloud for one quadrat. -->
    <!-- Suggested filename: docs/images/05-isolated-quadrat-points.png -->
