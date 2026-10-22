@@ -17,8 +17,7 @@ This workflow was developed using data from piñon-juniper woodland plots sample
    The remaining points are grouped spatially so that returns belonging to the same physical quadrat are treated as a single candidate. Small, isolated groups can be removed as noise.
 
    <!-- Optional image: show candidate reflective-tape point clusters before fitting. -->
-   ![Candidate reflective-tape point clusters before fitting](docs/images/Quadrat_findR_blue_quads.jpeg)
-
+![Candidate reflective-tape point clusters before fitting](Quadrat_findR_blue_quads.jpg)
 4. **Fit a square to each candidate**  
    For each candidate group, the script estimates the quadrat's position, orientation, and dimensions. A fitted square is then drawn around the detected tape points. In diagnostic plots, these fitted squares are shown in blue.
 
