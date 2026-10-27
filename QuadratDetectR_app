@@ -1,20 +1,20 @@
 # app.R
 # Shiny app: quadrat frame detection + clipping ONLY (MLS frames -> clip MLS and optional TLS)
 #
-# Workflow (mirrors detect_quadrats_fixed_v3.R):
+# Workflow:
 #   1) Upload MLS (needs an Intensity field) and, optionally, an aligned TLS scan.
-#      Both scans are read in full (no thinning, all attributes kept).
-#   2) "1. Detect quadrats": the MLS is filtered by intensity ONLY to find the frames
-#      (intensity filter -> connected components -> min-area rotated rectangle fit in each
-#      frame's best-fit plane). Quadrats are located in the MLS only.
+#   2) "1. Detect quadrats": only the bright MLS points (Intensity > cutoff) are read from the
+#      file and used to find the frames (connected components -> min-area rotated rectangle fit
+#      in each frame's best-fit plane). Quadrats are located in the MLS only. The full scans are
+#      never held in memory.
 #   3) Adjust the INWARD CLIP BUFFER (clip_inset). The red clip boundary in the plot updates
 #      live (use the zoom selector to inspect one frame).
-#   4) "2. Clip & export": clips the RAW, unprocessed MLS (and TLS) inside each frame (pulled
-#      inward by the buffer, height measured perpendicular to the fitted plane) and writes one
-#      combined LAZ per scan, named <original file name>_quadrats.laz. Optionally, each
-#      quadrat is also written as its own LAZ (<original file name>_<quadrat id>.laz).
-#      Everything is delivered as a zip download. You can change the buffer and re-run
-#      step 2 without re-running detection.
+#   4) "2. Clip & export": for each quadrat, the raw, unprocessed points (all attributes) in a
+#      small window around the frame are read from the MLS (and TLS) file and clipped inside the
+#      frame (pulled inward by the buffer, height measured perpendicular to the fitted plane).
+#      One combined LAZ per scan is written, named <original file name>_<MLS|TLS>_quadrats.laz.
+#      Optionally, each quadrat is also written as its own LAZ. Everything is delivered as a
+#      zip download. You can change the buffer and re-run step 2 without re-running detection.
 #
 # Progress messages are shown live to the user (progress bar, bottom-right) and printed to the
 # console. The processing log box is only shown when an error occurs.
@@ -36,7 +36,7 @@ check_packages <- function() {
 options(shiny.maxRequestSize = 1500 * 1024^2)
 
 # =============================================================================
-# Geometry helpers (from detect_quadrats_fixed_v3.R)
+# Geometry helpers
 # =============================================================================
 
 subset_las <- function(las_obj, idx) {
@@ -125,9 +125,9 @@ clip_las_rect <- function(las_obj, V, center3, sq_center, size_x, size_y, angle,
   subset_las(las_obj, pre[keep])
 }
 
-# ---- Quadrat detection (intensity filter + connected components + rectangle fit) ----
-# The intensity filter is applied to a COPY of the MLS used only for finding frames;
-# the original MLS object is left untouched.
+# ---- Quadrat detection (connected components + rectangle fit) ----
+# `MLS` should contain only the bright (frame) points; the intensity filter is re-applied here
+# so the function also works on a full cloud.
 # quad_length / quad_width: known outer frame dimensions in metres (both NULL = fit a square).
 detect_quadrat_squares <- function(MLS, intensity_cut = 30000, quad_length = NULL, quad_width = NULL,
                                    size_tol = 0.25,
@@ -233,9 +233,9 @@ ui <- fluidPage(
                 accept = c(".las", ".laz", ".LAS", ".LAZ")),
       fileInput("tls_file", "TLS scan (optional; must be aligned with the MLS)",
                 accept = c(".las", ".laz", ".LAS", ".LAZ")),
-      helpText("Quadrats are located in the MLS only (intensity-filtered copy). The TLS is clipped with the",
-               " same MLS-derived frames, so it must share the MLS coordinate system / registration.",
-               " Both scans are read in full and the exported LAZ files contain the raw, unprocessed points."),
+      helpText("Quadrats are located in the MLS only (bright points above the intensity cutoff). The TLS is",
+               " clipped with the same MLS-derived frames, so it must share the MLS coordinate system /",
+               " registration. The exported LAZ files contain the raw, unprocessed points with all attributes."),
       
       hr(),
       h4("Detection"),
@@ -302,7 +302,7 @@ ui <- fluidPage(
 
 server <- function(input, output, session) {
   rv <- reactiveValues(
-    MLS = NULL, TLS = NULL, shapes = NULL, pts = NULL,
+    MLS_path = NULL, TLS_path = NULL, shapes = NULL, pts = NULL,
     error_log = "", status = "", current_step = "Idle", progress = 0,
     laz_files = NULL, mls_name = "mls", tls_name = NULL
   )
@@ -367,12 +367,12 @@ server <- function(input, output, session) {
   })
   
   # ---------------------------------------------------------------------------
-  # Step 1: detection
+  # Step 1: detection (reads only the bright MLS points)
   # ---------------------------------------------------------------------------
   observeEvent(input$run_detect, {
     req(input$mls_file)
     rv$error_log <- ""; rv$status <- ""
-    rv$MLS <- NULL; rv$TLS <- NULL; rv$shapes <- NULL; rv$pts <- NULL; rv$laz_files <- NULL
+    rv$MLS_path <- NULL; rv$TLS_path <- NULL; rv$shapes <- NULL; rv$pts <- NULL; rv$laz_files <- NULL
     gc()
     
     rv$mls_name <- tools::file_path_sans_ext(input$mls_file$name)
@@ -389,21 +389,19 @@ server <- function(input, output, session) {
       tryCatch({
         check_packages()
         
-        set_progress("Read MLS", 0.05, "Reading MLS scan (all points, all attributes)...")
-        MLS <- lidR::readLAS(input$mls_file$datapath, select = "*")
-        if (is.null(MLS) || lidR::is.empty(MLS)) stop("MLS is empty or failed to load.")
-        if (!("Intensity" %in% names(MLS@data))) {
-          stop("No 'Intensity' field in MLS. Available: ", paste(names(MLS@data), collapse = ", "))
+        set_progress("Read MLS", 0.05, "Reading only the bright MLS points for frame detection...")
+        MLS <- lidR::readLAS(input$mls_file$datapath, select = "xyzi",
+                             filter = paste("-keep_intensity_above", input$intensity_cut))
+        if (is.null(MLS) || lidR::is.empty(MLS) || !("Intensity" %in% names(MLS@data))) {
+          stop("No MLS points above the intensity cutoff (or the file has no Intensity values). ",
+               "Try a lower cutoff.")
         }
-        note(sprintf("MLS points: %s", format(nrow(MLS@data), big.mark = ",")))
+        note(sprintf("Bright MLS points used for detection: %s", format(nrow(MLS@data), big.mark = ",")))
         
-        TLS <- NULL
+        TLS_hdr <- NULL
         if (!is.null(input$tls_file)) {
-          set_progress("Read TLS", 0.2, "Reading TLS scan (all points, all attributes)...")
-          TLS <- lidR::readLAS(input$tls_file$datapath, select = "*")
-          if (is.null(TLS) || lidR::is.empty(TLS)) stop("TLS is empty or failed to load.")
-          note(sprintf("TLS points: %s", format(nrow(TLS@data), big.mark = ",")))
-          gc()
+          set_progress("Check TLS", 0.2, "Reading TLS header only...")
+          TLS_hdr <- lidR::readLASheader(input$tls_file$datapath)
         }
         
         set_progress("Detect quadrats", 0.4,
@@ -416,6 +414,8 @@ server <- function(input, output, session) {
           error_pct_max = input$error_pct_max, mad_k = input$mad_k, trim_prob = input$trim_prob,
           angle_step_deg = input$angle_step_deg, tilt_clip = isTRUE(input$tilt_clip)
         )
+        rm(MLS); gc()
+        
         shapes_df <- det$shapes
         if (nrow(shapes_df) == 0) {
           stop("No quadrat frames passed the filters. Try a different intensity cutoff, loosen the aspect / ",
@@ -424,10 +424,11 @@ server <- function(input, output, session) {
         shapes_df$quadrat_id <- paste0("Q", seq_len(nrow(shapes_df)))
         set_progress("Detect quadrats", 0.85, sprintf("Detected %d quadrat(s) in the MLS scan.", nrow(shapes_df)))
         
-        if (!is.null(TLS)) {
+        if (!is.null(TLS_hdr)) {
+          h <- TLS_hdr@PHB
           cx <- vapply(shapes_df$corners, function(m) mean(m[, 1]), numeric(1))
           cy <- vapply(shapes_df$corners, function(m) mean(m[, 2]), numeric(1))
-          inside <- cx >= min(TLS$X) & cx <= max(TLS$X) & cy >= min(TLS$Y) & cy <= max(TLS$Y)
+          inside <- cx >= h[["Min X"]] & cx <= h[["Max X"]] & cy >= h[["Min Y"]] & cy <= h[["Max Y"]]
           if (!any(inside)) {
             stop("None of the MLS-detected quadrats fall inside the TLS extent. The TLS must be spatially ",
                  "aligned with the MLS (same coordinate system / registration).")
@@ -443,7 +444,7 @@ server <- function(input, output, session) {
         pts <- det$pts
         if (nrow(pts) > 200000) pts <- pts[sample.int(nrow(pts), 200000), ]   # display only
         
-        list(MLS = MLS, TLS = TLS, shapes = shapes_df, pts = pts)
+        list(shapes = shapes_df, pts = pts)
       }, error = function(e) {
         add_error(conditionMessage(e))
         NULL
@@ -455,7 +456,9 @@ server <- function(input, output, session) {
       rv$status <- "Detection failed - see the error log."
       return()
     }
-    rv$MLS <- res$MLS; rv$TLS <- res$TLS; rv$shapes <- res$shapes; rv$pts <- res$pts
+    rv$MLS_path <- input$mls_file$datapath
+    rv$TLS_path <- if (!is.null(input$tls_file)) input$tls_file$datapath else NULL
+    rv$shapes <- res$shapes; rv$pts <- res$pts
     updateSelectInput(session, "zoom_quad",
                       choices = c("All" = "All", stats::setNames(res$shapes$quadrat_id, res$shapes$quadrat_id)),
                       selected = "All")
@@ -464,10 +467,10 @@ server <- function(input, output, session) {
   })
   
   # ---------------------------------------------------------------------------
-  # Step 2: clip + export
+  # Step 2: clip + export (reads one small window per quadrat from each file)
   # ---------------------------------------------------------------------------
   observeEvent(input$run_clip, {
-    if (is.null(rv$shapes) || is.null(rv$MLS)) {
+    if (is.null(rv$shapes) || is.null(rv$MLS_path)) {
       showNotification("Run '1. Detect quadrats' first.", type = "error")
       return()
     }
@@ -480,7 +483,7 @@ server <- function(input, output, session) {
     
     # output names: original file name + scan type (_MLS / _TLS) + "_quadrats"
     out_names <- list(MLS = paste0(rv$mls_name, "_MLS"))
-    if (!is.null(rv$TLS)) out_names$TLS <- paste0(rv$tls_name, "_TLS")
+    if (!is.null(rv$TLS_path)) out_names$TLS <- paste0(rv$tls_name, "_TLS")
     
     message(sprintf("---- Clipping: inward buffer = %.4f m, max height = %.2f m, individual files = %s ----",
                     inset, max_h, export_indiv))
@@ -490,22 +493,31 @@ server <- function(input, output, session) {
         out_dir <- file.path(tempdir(), paste0("quadrats_", format(Sys.time(), "%Y%m%d_%H%M%S")))
         dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
         
-        scans <- list(MLS = rv$MLS)
-        if (!is.null(rv$TLS)) scans$TLS <- rv$TLS
+        scans <- list(MLS = rv$MLS_path)
+        if (!is.null(rv$TLS_path)) scans$TLS <- rv$TLS_path
         
         laz_files <- character(0)
         nsc <- length(scans)
         for (si in seq_along(scans)) {
           scan_name <- names(scans)[si]
-          las_in <- scans[[si]]
+          scan_path <- scans[[si]]
           parts <- list()
           for (j in seq_len(nq)) {
             qid <- shapes_df$quadrat_id[j]
             set_progress(paste0(scan_name, " ", qid, " clip"),
                          ((si - 1) + (j - 1) / nq) / nsc * 0.9,
                          sprintf("Clipping %s (%d/%d)...", scan_name, j, nq))
-            part <- clip_las_rect(
-              las_in,
+            
+            # read only the window around this quadrat (all attributes, raw points)
+            cr <- shapes_df$corners[[j]]
+            mg <- 0.1 + max_h + max(0, -inset)
+            win <- lidR::readLAS(
+              scan_path, select = "*",
+              filter = sprintf("-keep_xy %.4f %.4f %.4f %.4f",
+                               min(cr[, 1]) - mg, min(cr[, 2]) - mg,
+                               max(cr[, 1]) + mg, max(cr[, 2]) + mg))
+            part <- if (is.null(win) || lidR::is.empty(win)) NULL else clip_las_rect(
+              win,
               V = shapes_df$V[[j]], center3 = shapes_df$center3[[j]],
               sq_center = shapes_df$sq_center[[j]],
               size_x = shapes_df$size_x[j], size_y = shapes_df$size_y[j],
@@ -513,6 +525,8 @@ server <- function(input, output, session) {
               inset = inset, max_height = max_h, min_height = -Inf,
               corners = shapes_df$corners[[j]]
             )
+            rm(win)
+            
             if (is.null(part) || lidR::is.empty(part)) {
               note(sprintf("%s %s: no points inside the clip volume (buffer may be too large).", scan_name, qid))
               next
