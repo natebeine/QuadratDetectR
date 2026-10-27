@@ -2,11 +2,9 @@
 
 ![QuadratDetectR title image](QuadratDetectR_title_pic.jpg)
 
-`QuadratFindR` identifies 1 m² quadrats in ground-based LiDAR point clouds. The workflow uses reflective tape placed around each quadrat as a visual and geometric marker.
+`QuadratDetectR` provides an automated approach to extracting LiDAR points from within field quadrats. This requires an MLS scan of a plot with reflective tape wrapped quadrats.
 
 ## How quadrats are identified
-
-`QuadratDetectR` locates 1 m² quadrats in ground-based LiDAR point clouds by using the reflective tape placed around each quadrat as a visual and geometric marker.
 
 This workflow was developed using data from piñon-juniper woodland plots sampled as part of [Nate Beine's master's thesis](https://www.proquest.com/docview/3344191296?pq-origsite=gscholar&fromopenview=true).
 
