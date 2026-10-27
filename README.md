@@ -4,6 +4,8 @@
 
 This workflow was developed using data from piñon-juniper woodland plots sampled as part of [Nate Beine's master's thesis](https://www.proquest.com/docview/3344191296?pq-origsite=gscholar&fromopenview=true&sourcetype=Dissertations%20&%20Theses).
 
+![QuadratDetectR title image](QuadratDetectR_title_pic.jpg)
+
 1. **Load the LiDAR point cloud**  
    The script reads a TLS or MLS point cloud containing the surveyed ground surface and any reflective quadrat markers.
 
@@ -36,6 +38,19 @@ This workflow was developed using data from piñon-juniper woodland plots sample
 
 6. **Extract points within each quadrat**  
    Once the quadrat boundaries have been identified, the script selects the LiDAR points inside each 1 m² square. These extracted points can then be saved or used for downstream analyses of vegetation structure and composition.
+
+   <table>
+     <tr>
+       <td align="center"><strong>Source point cloud</strong></td>
+       <td align="center"></td>
+       <td align="center"><strong>Extracted quadrats</strong></td>
+     </tr>
+     <tr>
+       <td align="center"><img src="QuadratDetectR_point_cloud.jpg" alt="Source LiDAR point cloud for quadrat detection" width="320"></td>
+       <td align="center"><strong>→</strong></td>
+       <td align="center"><img src="QuadratDetectR_extracted_quads.jpg" alt="Extracted quadrat point clouds" width="320"></td>
+     </tr>
+   </table>
 
    <!-- Optional image: show the final isolated point cloud for one quadrat. -->
    <!-- Suggested filename: docs/images/05-isolated-quadrat-points.png -->
