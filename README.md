@@ -10,7 +10,7 @@ This workflow was developed using data from piñon-juniper woodland plots sample
 
 1. **Load the LiDAR point cloud**
 
-   The script reads a TLS or MLS point cloud containing the surveyed ground surface and any reflective quadrat markers.
+   The script reads in an MLS point cloud containing the surveyed ground surface and any reflective quadrat markers. It can optionally also extract points from a TLS point cloud that is properly aligned spatially with the MLS point cloud.
 
    ![Original LiDAR point cloud containing the quadrats](QuadratDetectR_point_cloud.jpg)
 
