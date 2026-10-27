@@ -1,0 +1,641 @@
+# app.R
+# Shiny app: quadrat frame detection + clipping ONLY (MLS frames -> clip MLS and optional TLS)
+#
+# Workflow (mirrors detect_quadrats_fixed_v3.R):
+#   1) Upload MLS (needs an Intensity field) and, optionally, an aligned TLS scan.
+#      Both scans are read in full (no thinning, all attributes kept).
+#   2) "1. Detect quadrats": the MLS is filtered by intensity ONLY to find the frames
+#      (intensity filter -> connected components -> min-area rotated rectangle fit in each
+#      frame's best-fit plane). Quadrats are located in the MLS only.
+#   3) Adjust the INWARD CLIP BUFFER (clip_inset). The red clip boundary in the plot updates
+#      live (use the zoom selector to inspect one frame).
+#   4) "2. Clip & export": clips the RAW, unprocessed MLS (and TLS) inside each frame (pulled
+#      inward by the buffer, height measured perpendicular to the fitted plane) and writes one
+#      combined LAZ per scan, named <original file name>_quadrats.laz. Optionally, each
+#      quadrat is also written as its own LAZ (<original file name>_<quadrat id>.laz).
+#      Everything is delivered as a zip download. You can change the buffer and re-run
+#      step 2 without re-running detection.
+#
+# Progress messages are shown live to the user (progress bar, bottom-right) and printed to the
+# console. The processing log box is only shown when an error occurs.
+
+suppressPackageStartupMessages({
+  library(shiny)
+  library(dplyr)
+  library(tibble)
+})
+
+check_packages <- function() {
+  needed <- c("lidR")
+  missing <- needed[!vapply(needed, requireNamespace, quietly = TRUE, FUN.VALUE = logical(1))]
+  if (length(missing)) stop("Missing required package(s): ", paste(missing, collapse = ", "), call. = FALSE)
+  invisible(TRUE)
+}
+
+# Large uploads (TLS clouds are big). Adjust to what your host allows.
+options(shiny.maxRequestSize = 1500 * 1024^2)
+
+# =============================================================================
+# Geometry helpers (from detect_quadrats_fixed_v3.R)
+# =============================================================================
+
+subset_las <- function(las_obj, idx) {
+  if (length(idx) == 0) return(NULL)
+  lidR::LAS(las_obj@data[idx, , drop = FALSE], header = las_obj@header, check = FALSE)
+}
+
+# Rotate xyz into the best-fit plane frame (z_rot = distance from plane).
+plane_frame <- function(xyz, use_plane = TRUE) {
+  xyz <- as.matrix(xyz)
+  if (!use_plane) return(list(V = diag(3), center3 = c(0, 0, 0), rot = xyz))
+  center3 <- colMeans(xyz)
+  Xc <- sweep(xyz, 2, center3)
+  V <- svd(Xc, nu = 0, nv = 3)$v
+  if (det(V) < 0) V[, 3] <- -V[, 3]
+  if (V[3, 3] < 0) { V[, 3] <- -V[, 3]; V[, 2] <- -V[, 2] }   # plane normal points up
+  list(V = V, center3 = center3, rot = Xc %*% V)
+}
+
+# Min-area rotated rectangle
+fit_square_minarea <- function(xy, angle_step_deg = 0.5, trim_prob = 0) {
+  xy <- as.matrix(xy)
+  angles <- seq(0, 90 - angle_step_deg, by = angle_step_deg) * pi / 180
+  rng_fun <- if (trim_prob > 0) {
+    function(v) quantile(v, c(trim_prob, 1 - trim_prob), names = FALSE)
+  } else {
+    function(v) range(v)
+  }
+  best <- NULL
+  for (a in angles) {
+    R <- matrix(c(cos(a), sin(a), -sin(a), cos(a)), 2)
+    p <- xy %*% R
+    r1 <- rng_fun(p[, 1]); r2 <- rng_fun(p[, 2])
+    w <- diff(r1); h <- diff(r2)
+    area <- w * h
+    if (is.null(best) || area < best$area) {
+      best <- list(area = area, angle = a, w = w, h = h,
+                   center = as.vector(R %*% c(mean(r1), mean(r2))))
+    }
+  }
+  best$size <- mean(c(best$w, best$h))
+  best
+}
+
+# Corners of a rotated rectangle (matrix X, Y), counter-clockwise.
+# sx = extent along the rotated x axis, sy = extent along the rotated y axis.
+rotated_rect_corners <- function(center, sx, sy, angle) {
+  hx <- sx / 2; hy <- sy / 2
+  local <- matrix(c(-hx, -hy,  hx, -hy,  hx, hy,  -hx, hy), ncol = 2, byrow = TRUE)
+  Rpos <- matrix(c(cos(angle), sin(angle), -sin(angle), cos(angle)), 2)
+  corners <- local %*% t(Rpos)
+  corners <- sweep(corners, 2, center, "+")
+  colnames(corners) <- c("X", "Y")
+  corners
+}
+
+# Clip a LAS to the INSIDE of a rotated rectangle defined in a plane frame.
+# inset > 0 pulls the clip edge inward by `inset` metres on every side (negative = outward).
+# Height is measured perpendicular to the fitted plane (upper limit = max_height, no lower limit).
+# `corners` (3D corners in original XYZ) is used only for a cheap XY pre-filter.
+# The returned LAS is a plain row subset of the input: no points are modified or thinned.
+clip_las_rect <- function(las_obj, V, center3, sq_center, size_x, size_y, angle, z_level = 0,
+                          inset = 0, max_height = Inf, min_height = -Inf, corners = NULL) {
+  half_x <- size_x / 2 - inset
+  half_y <- size_y / 2 - inset
+  if (half_x <= 0 || half_y <= 0) return(NULL)
+  d <- las_obj@data
+  pre <- seq_len(nrow(d))
+  if (!is.null(corners)) {
+    mh <- if (is.finite(max_height)) abs(max_height) else 3
+    mn <- if (is.finite(min_height)) abs(min_height) else 3
+    mg <- 0.1 + 0.5 * max(mh, mn) + max(0, -inset)
+    cx <- mean(corners[, 1]); cy <- mean(corners[, 2])
+    ex <- max(abs(corners[, 1] - cx)) + mg
+    ey <- max(abs(corners[, 2] - cy)) + mg
+    pre <- which(abs(d$X - cx) <= ex & abs(d$Y - cy) <= ey)
+    if (length(pre) == 0) return(NULL)
+  }
+  xyz <- cbind(d$X[pre], d$Y[pre], d$Z[pre])
+  rot <- sweep(xyz, 2, center3) %*% V
+  Rneg <- matrix(c(cos(angle), sin(angle), -sin(angle), cos(angle)), 2)
+  local <- sweep(rot[, 1:2, drop = FALSE], 2, sq_center) %*% Rneg
+  h <- rot[, 3] - z_level
+  keep <- which(abs(local[, 1]) <= half_x & abs(local[, 2]) <= half_y &
+                  h <= max_height & h >= min_height)
+  subset_las(las_obj, pre[keep])
+}
+
+# ---- Quadrat detection (intensity filter + connected components + rectangle fit) ----
+# The intensity filter is applied to a COPY of the MLS used only for finding frames;
+# the original MLS object is left untouched.
+# quad_length / quad_width: known outer frame dimensions in metres (both NULL = fit a square).
+detect_quadrat_squares <- function(MLS, intensity_cut = 30000, quad_length = NULL, quad_width = NULL,
+                                   size_tol = 0.25,
+                                   conn_res = 0.1, conn_min_pts = 5, min_pts_component = 30,
+                                   aspect_tol = 0.20, error_pct_max = 10, mad_k = 3,
+                                   trim_prob = 0.01, angle_step_deg = 0.5, tilt_clip = TRUE) {
+  known <- !is.null(quad_length) && !is.null(quad_width)
+  max_known <- if (known) max(quad_length, quad_width) else NA_real_
+  
+  MLS_filt <- lidR::filter_poi(MLS, Intensity > intensity_cut)
+  if (lidR::is.empty(MLS_filt)) return(list(shapes = tibble::tibble(), pts = NULL))
+  
+  MLS_filt <- lidR::connected_components(MLS_filt, res = conn_res, min_pts = conn_min_pts, name = "Component")
+  df <- as.data.frame(MLS_filt@data)
+  df <- df[!is.na(df$Component), ]
+  rm(MLS_filt)
+  
+  shapes <- list()
+  for (cid in unique(df$Component)) {
+    comp <- df[df$Component == cid, ]
+    if (nrow(comp) < min_pts_component) next
+    
+    if (known) {
+      ext <- max(diff(range(comp$X)), diff(range(comp$Y)))
+      if (ext > max_known * 3) next
+    }
+    
+    fr <- plane_frame(comp[, c("X", "Y", "Z")], use_plane = tilt_clip)
+    rxy <- fr$rot[, 1:2, drop = FALSE]
+    
+    # 1) Outlier trimming
+    cen0 <- apply(rxy, 2, median)
+    d <- sqrt(rowSums(sweep(rxy, 2, cen0)^2))
+    keep <- d <= median(d) + mad_k * mad(d)
+    if (known) keep <- keep & d <= max_known * 0.9
+    if (sum(keep) < min_pts_component) next
+    rxy_k <- rxy[keep, , drop = FALSE]
+    rz_k  <- fr$rot[keep, 3]
+    
+    # 2) Min-area rotated rectangle
+    fit <- fit_square_minarea(rxy_k, angle_step_deg, trim_prob)
+    
+    # 3) Frame dimensions + shape sanity checks
+    if (known) {
+      # assign the known length/width to the fitted axes (whichever pairing matches best)
+      if ((abs(fit$w - quad_length) + abs(fit$h - quad_width)) <=
+          (abs(fit$w - quad_width) + abs(fit$h - quad_length))) {
+        sx <- quad_length; sy <- quad_width
+      } else {
+        sx <- quad_width; sy <- quad_length
+      }
+      if (abs(fit$w - sx) > size_tol * sx || abs(fit$h - sy) > size_tol * sy) next
+    } else {
+      sx <- fit$size; sy <- fit$size
+      if (abs(fit$w - fit$h) > aspect_tol * fit$size) next
+    }
+    size_ref <- mean(c(sx, sy))
+    if (size_ref <= 0) next
+    
+    # 4) Fit error
+    Rneg <- matrix(c(cos(fit$angle), sin(fit$angle), -sin(fit$angle), cos(fit$angle)), 2)
+    lp <- sweep(rxy_k, 2, fit$center) %*% Rneg
+    hx <- sx / 2; hy <- sy / 2
+    edge_d <- pmin(abs(abs(lp[, 1]) - hx), abs(abs(lp[, 2]) - hy))
+    raw_error <- mean(edge_d)
+    error_pct <- raw_error / size_ref * 100
+    if (error_pct > error_pct_max) next
+    votes <- sum(abs(lp[, 1]) <= hx & abs(lp[, 2]) <= hy)
+    
+    # 5) Corners back in original XYZ
+    z_level <- median(rz_k)
+    c_rot <- rotated_rect_corners(fit$center, sx, sy, fit$angle)
+    c_orig <- cbind(c_rot, z_level) %*% t(fr$V)
+    c_orig <- sweep(c_orig, 2, fr$center3, "+")
+    colnames(c_orig) <- c("X", "Y", "Z")
+    
+    shapes[[length(shapes) + 1]] <- tibble::tibble(
+      type = "rectangle", component = cid,
+      V = list(fr$V), center3 = list(fr$center3),
+      sq_center = list(fit$center), z_level = z_level,
+      size_x = sx, size_y = sy, fitted_x = fit$w, fitted_y = fit$h,
+      angle = fit$angle,
+      raw_error = raw_error, error_pct = error_pct, votes = votes,
+      corners = list(c_orig)
+    )
+  }
+  
+  shapes_df <- if (length(shapes) == 0) tibble::tibble() else dplyr::bind_rows(shapes)
+  list(shapes = shapes_df, pts = df[, c("X", "Y", "Z")])
+}
+
+# =============================================================================
+# UI
+# =============================================================================
+
+ui <- fluidPage(
+  titlePanel("Quadrat Extraction (MLS frames -> clipped MLS / TLS LAZ)"),
+  sidebarLayout(
+    sidebarPanel(
+      width = 4,
+      h4("Input"),
+      fileInput("mls_file", "MLS scan (LAS/LAZ, must contain Intensity)",
+                accept = c(".las", ".laz", ".LAS", ".LAZ")),
+      fileInput("tls_file", "TLS scan (optional; must be aligned with the MLS)",
+                accept = c(".las", ".laz", ".LAS", ".LAZ")),
+      helpText("Quadrats are located in the MLS only (intensity-filtered copy). The TLS is clipped with the",
+               " same MLS-derived frames, so it must share the MLS coordinate system / registration.",
+               " Both scans are read in full and the exported LAZ files contain the raw, unprocessed points."),
+      
+      hr(),
+      h4("Detection"),
+      numericInput("intensity_cut", "MLS intensity cutoff (frame detection)", 30000, min = 0, step = 500),
+      numericInput("quad_length", "Known outer frame length (m; blank = fit)", NA, min = 0.1, step = 0.05),
+      numericInput("quad_width", "Known outer frame width (m; blank = fit)", NA, min = 0.1, step = 0.05),
+      helpText("Leave both blank to fit the frame size from the data (assumed square). If only one value",
+               " is entered, the frame is treated as square with that side length."),
+      checkboxInput("tilt_clip", "Fit/clip in best-fit plane of each frame (tilt-aware)", TRUE),
+      tags$details(
+        tags$summary("Advanced detection settings"),
+        numericInput("size_tol", "Size tolerance (fraction of known size)", 0.25, min = 0, step = 0.05),
+        numericInput("conn_res", "Connected-components resolution (m)", 0.1, min = 0.01, step = 0.01),
+        numericInput("conn_min_pts", "Connected-components min points", 5, min = 1, step = 1),
+        numericInput("min_pts_component", "Min points per component", 30, min = 3, step = 5),
+        numericInput("aspect_tol", "Aspect tolerance when size is fitted (|w-h| <= tol * size)", 0.20, min = 0, step = 0.05),
+        numericInput("error_pct_max", "Max fit error (% of size)", 10, min = 0, step = 1),
+        numericInput("mad_k", "Outlier cutoff (MADs)", 3, min = 0, step = 0.5),
+        numericInput("trim_prob", "Robust box trim (each side, 0 = off)", 0.01, min = 0, max = 0.2, step = 0.005),
+        numericInput("angle_step_deg", "Angle search step (deg)", 0.5, min = 0.1, step = 0.1)
+      ),
+      actionButton("run_detect", "1. Detect quadrats", class = "btn-primary"),
+      
+      hr(),
+      h4("Clipping"),
+      sliderInput("clip_inset_slider", "Inward clip buffer from frame edge (m)",
+                  min = -0.05, max = 0.15, value = 0.05, step = 0.005),
+      numericInput("clip_inset", "Inward clip buffer - exact value (m)", 0.05, step = 0.001),
+      helpText("Positive = clip pulled INSIDE the frame (frame excluded); 0 = exactly on the fitted",
+               " frame; negative = expands outward. The red boundary in the plot updates live."),
+      numericInput("clip_max_height", "Max height above frame plane (m)", 1.37, min = 0.01, step = 0.01),
+      checkboxInput("export_individual", "Also export each quadrat as its own LAZ file", FALSE),
+      helpText("The combined LAZ (all quadrats in one file) is always exported. When ticked, one extra LAZ",
+               " per quadrat is also included in the download."),
+      actionButton("run_clip", "2. Clip & export", class = "btn-success"),
+      
+      br(), br(),
+      strong("Current step: "), textOutput("current_step", inline = TRUE),
+      br(),
+      strong("Progress: "), textOutput("progress_pct", inline = TRUE),
+      br(), br(),
+      uiOutput("download_ui")
+    ),
+    mainPanel(
+      width = 8,
+      h4("Processing Progress"),
+      uiOutput("progress_ui"),
+      textOutput("status_msg"),
+      # Log is only shown when an error occurred
+      uiOutput("error_ui"),
+      h4("Detected Quadrats"),
+      selectInput("zoom_quad", "Zoom to quadrat", choices = c("All" = "All"), selected = "All"),
+      plotOutput("quadrat_plot", height = "450px"),
+      helpText("Blue = fitted frame, red = clip boundary (frame edge minus the inward buffer)."),
+      h4("Quadrat Fits"),
+      tableOutput("quadrat_fits_table")
+    )
+  )
+)
+
+# =============================================================================
+# SERVER
+# =============================================================================
+
+server <- function(input, output, session) {
+  rv <- reactiveValues(
+    MLS = NULL, TLS = NULL, shapes = NULL, pts = NULL,
+    error_log = "", status = "", current_step = "Idle", progress = 0,
+    laz_files = NULL, mls_name = "mls", tls_name = NULL
+  )
+  
+  # keep slider and numeric box for the inward buffer in sync
+  observeEvent(input$clip_inset_slider, {
+    if (!isTRUE(all.equal(input$clip_inset_slider, input$clip_inset)))
+      updateNumericInput(session, "clip_inset", value = input$clip_inset_slider)
+  }, ignoreInit = TRUE)
+  observeEvent(input$clip_inset, {
+    req(is.finite(input$clip_inset))
+    if (!isTRUE(all.equal(input$clip_inset_slider, input$clip_inset)))
+      updateSliderInput(session, "clip_inset_slider", value = input$clip_inset)
+  }, ignoreInit = TRUE)
+  
+  # ---- messaging helpers ----------------------------------------------------
+  # Errors are the only thing written to the on-screen log.
+  add_error <- function(msg) {
+    message("ERROR: ", msg)
+    rv$error_log <- paste(c(rv$error_log[nzchar(rv$error_log)], msg), collapse = "\n")
+  }
+  
+  # Progress: printed to the console AND shown live to the user (progress bar, bottom-right).
+  # Works inside withProgress(); outside of it only the console/status text are updated.
+  set_progress <- function(step, p, msg = NULL) {
+    p <- max(0, min(1, p))
+    rv$current_step <- step
+    rv$progress <- p
+    txt <- if (is.null(msg)) step else msg
+    rv$status <- txt
+    message(sprintf("[%3d%%] %s - %s", round(p * 100), step, txt))
+    try(shiny::setProgress(value = p, message = step, detail = txt), silent = TRUE)
+  }
+  
+  # Informational note (console + live progress detail, not in the log box)
+  note <- function(msg) {
+    rv$status <- msg
+    message(msg)
+    try(shiny::setProgress(detail = msg), silent = TRUE)
+  }
+  
+  output$current_step <- renderText(rv$current_step)
+  output$progress_pct <- renderText(sprintf("%d%%", round(100 * rv$progress)))
+  output$progress_ui <- renderUI({
+    tags$div(
+      style = "width:100%; background:#eee; border-radius:6px; height:20px;",
+      tags$div(style = sprintf("width:%s; background:#2c7fb8; height:20px; border-radius:6px; transition: width 0.2s;",
+                               paste0(round(100 * rv$progress), "%")))
+    )
+  })
+  output$status_msg <- renderText(rv$status)
+  
+  output$error_ui <- renderUI({
+    if (!nzchar(rv$error_log)) return(NULL)
+    tagList(h4("Error Log"), verbatimTextOutput("log_output"))
+  })
+  output$log_output <- renderText(rv$error_log)
+  
+  inset_val <- reactive({
+    v <- input$clip_inset
+    if (is.null(v) || !is.finite(v)) 0 else v
+  })
+  
+  # ---------------------------------------------------------------------------
+  # Step 1: detection
+  # ---------------------------------------------------------------------------
+  observeEvent(input$run_detect, {
+    req(input$mls_file)
+    rv$error_log <- ""; rv$status <- ""
+    rv$MLS <- NULL; rv$TLS <- NULL; rv$shapes <- NULL; rv$pts <- NULL; rv$laz_files <- NULL
+    gc()
+    
+    rv$mls_name <- tools::file_path_sans_ext(input$mls_file$name)
+    rv$tls_name <- if (!is.null(input$tls_file)) tools::file_path_sans_ext(input$tls_file$name) else NULL
+    
+    # known frame dimensions (blank = fit; one value = square)
+    qL <- input$quad_length; qW <- input$quad_width
+    qL <- if (is.null(qL) || is.na(qL)) NULL else qL
+    qW <- if (is.null(qW) || is.na(qW)) NULL else qW
+    if (is.null(qL) && !is.null(qW)) qL <- qW
+    if (is.null(qW) && !is.null(qL)) qW <- qL
+    
+    res <- withProgress(message = "Detecting quadrats", value = 0, {
+      tryCatch({
+        check_packages()
+        
+        set_progress("Read MLS", 0.05, "Reading MLS scan (all points, all attributes)...")
+        MLS <- lidR::readLAS(input$mls_file$datapath, select = "*")
+        if (is.null(MLS) || lidR::is.empty(MLS)) stop("MLS is empty or failed to load.")
+        if (!("Intensity" %in% names(MLS@data))) {
+          stop("No 'Intensity' field in MLS. Available: ", paste(names(MLS@data), collapse = ", "))
+        }
+        note(sprintf("MLS points: %s", format(nrow(MLS@data), big.mark = ",")))
+        
+        TLS <- NULL
+        if (!is.null(input$tls_file)) {
+          set_progress("Read TLS", 0.2, "Reading TLS scan (all points, all attributes)...")
+          TLS <- lidR::readLAS(input$tls_file$datapath, select = "*")
+          if (is.null(TLS) || lidR::is.empty(TLS)) stop("TLS is empty or failed to load.")
+          note(sprintf("TLS points: %s", format(nrow(TLS@data), big.mark = ",")))
+          gc()
+        }
+        
+        set_progress("Detect quadrats", 0.4,
+                     paste0("Locating quadrat frames in the MLS (Intensity > ", input$intensity_cut, ")..."))
+        if (!is.null(qL)) note(sprintf("Using known frame size: %.3f m x %.3f m", qL, qW))
+        det <- detect_quadrat_squares(
+          MLS, intensity_cut = input$intensity_cut, quad_length = qL, quad_width = qW,
+          size_tol = input$size_tol, conn_res = input$conn_res, conn_min_pts = input$conn_min_pts,
+          min_pts_component = input$min_pts_component, aspect_tol = input$aspect_tol,
+          error_pct_max = input$error_pct_max, mad_k = input$mad_k, trim_prob = input$trim_prob,
+          angle_step_deg = input$angle_step_deg, tilt_clip = isTRUE(input$tilt_clip)
+        )
+        shapes_df <- det$shapes
+        if (nrow(shapes_df) == 0) {
+          stop("No quadrat frames passed the filters. Try a different intensity cutoff, loosen the aspect / ",
+               "error settings, or set a known frame length and width.")
+        }
+        shapes_df$quadrat_id <- paste0("Q", seq_len(nrow(shapes_df)))
+        set_progress("Detect quadrats", 0.85, sprintf("Detected %d quadrat(s) in the MLS scan.", nrow(shapes_df)))
+        
+        if (!is.null(TLS)) {
+          cx <- vapply(shapes_df$corners, function(m) mean(m[, 1]), numeric(1))
+          cy <- vapply(shapes_df$corners, function(m) mean(m[, 2]), numeric(1))
+          inside <- cx >= min(TLS$X) & cx <= max(TLS$X) & cy >= min(TLS$Y) & cy <= max(TLS$Y)
+          if (!any(inside)) {
+            stop("None of the MLS-detected quadrats fall inside the TLS extent. The TLS must be spatially ",
+                 "aligned with the MLS (same coordinate system / registration).")
+          }
+          if (!all(inside)) {
+            wmsg <- paste0("Warning: quadrat(s) outside TLS extent: ",
+                           paste(shapes_df$quadrat_id[!inside], collapse = ", "))
+            note(wmsg)
+            showNotification(wmsg, type = "warning", duration = 10)
+          }
+        }
+        
+        pts <- det$pts
+        if (nrow(pts) > 200000) pts <- pts[sample.int(nrow(pts), 200000), ]   # display only
+        
+        list(MLS = MLS, TLS = TLS, shapes = shapes_df, pts = pts)
+      }, error = function(e) {
+        add_error(conditionMessage(e))
+        NULL
+      })
+    })
+    
+    if (is.null(res)) {
+      rv$current_step <- "Failed"
+      rv$status <- "Detection failed - see the error log."
+      return()
+    }
+    rv$MLS <- res$MLS; rv$TLS <- res$TLS; rv$shapes <- res$shapes; rv$pts <- res$pts
+    updateSelectInput(session, "zoom_quad",
+                      choices = c("All" = "All", stats::setNames(res$shapes$quadrat_id, res$shapes$quadrat_id)),
+                      selected = "All")
+    set_progress("Detection done", 1, "Detection complete. Adjust the inward buffer if needed, then click '2. Clip & export'.")
+    gc()
+  })
+  
+  # ---------------------------------------------------------------------------
+  # Step 2: clip + export
+  # ---------------------------------------------------------------------------
+  observeEvent(input$run_clip, {
+    if (is.null(rv$shapes) || is.null(rv$MLS)) {
+      showNotification("Run '1. Detect quadrats' first.", type = "error")
+      return()
+    }
+    rv$error_log <- ""; rv$status <- ""
+    shapes_df <- rv$shapes
+    nq <- nrow(shapes_df)
+    inset <- inset_val()
+    max_h <- input$clip_max_height
+    export_indiv <- isTRUE(input$export_individual)
+    
+    # output names: original file name + scan type (_MLS / _TLS) + "_quadrats"
+    out_names <- list(MLS = paste0(rv$mls_name, "_MLS"))
+    if (!is.null(rv$TLS)) out_names$TLS <- paste0(rv$tls_name, "_TLS")
+    
+    message(sprintf("---- Clipping: inward buffer = %.4f m, max height = %.2f m, individual files = %s ----",
+                    inset, max_h, export_indiv))
+    
+    res <- withProgress(message = "Clipping quadrats", value = 0, {
+      tryCatch({
+        out_dir <- file.path(tempdir(), paste0("quadrats_", format(Sys.time(), "%Y%m%d_%H%M%S")))
+        dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+        
+        scans <- list(MLS = rv$MLS)
+        if (!is.null(rv$TLS)) scans$TLS <- rv$TLS
+        
+        laz_files <- character(0)
+        nsc <- length(scans)
+        for (si in seq_along(scans)) {
+          scan_name <- names(scans)[si]
+          las_in <- scans[[si]]
+          parts <- list()
+          for (j in seq_len(nq)) {
+            qid <- shapes_df$quadrat_id[j]
+            set_progress(paste0(scan_name, " ", qid, " clip"),
+                         ((si - 1) + (j - 1) / nq) / nsc * 0.9,
+                         sprintf("Clipping %s (%d/%d)...", scan_name, j, nq))
+            part <- clip_las_rect(
+              las_in,
+              V = shapes_df$V[[j]], center3 = shapes_df$center3[[j]],
+              sq_center = shapes_df$sq_center[[j]],
+              size_x = shapes_df$size_x[j], size_y = shapes_df$size_y[j],
+              angle = shapes_df$angle[j], z_level = shapes_df$z_level[j],
+              inset = inset, max_height = max_h, min_height = -Inf,
+              corners = shapes_df$corners[[j]]
+            )
+            if (is.null(part) || lidR::is.empty(part)) {
+              note(sprintf("%s %s: no points inside the clip volume (buffer may be too large).", scan_name, qid))
+              next
+            }
+            note(sprintf("%s %s: %s points.", scan_name, qid, format(nrow(part@data), big.mark = ",")))
+            parts[[qid]] <- part
+            
+            # optional: one LAZ per quadrat
+            if (export_indiv) {
+              ipath <- file.path(out_dir, paste0(out_names[[scan_name]], "_", qid, ".laz"))
+              lidR::writeLAS(part, ipath)
+              laz_files <- c(laz_files, ipath)
+              note(paste("Wrote", basename(ipath)))
+            }
+          }
+          if (length(parts) == 0) {
+            note(paste("No points clipped for scan", scan_name))
+            next
+          }
+          
+          set_progress(paste0("Write ", scan_name), (si / nsc) * 0.95,
+                       paste("Writing combined", scan_name, "LAZ file..."))
+          merged <- do.call(rbind, unname(parts))
+          path <- file.path(out_dir, paste0(out_names[[scan_name]], "_quadrats.laz"))
+          lidR::writeLAS(merged, path)
+          laz_files <- c(laz_files, path)
+          note(paste("Wrote", basename(path)))
+          rm(merged, parts); gc()
+        }
+        laz_files
+      }, error = function(e) {
+        add_error(conditionMessage(e))
+        NULL
+      })
+    })
+    
+    if (is.null(res) || length(res) == 0) {
+      rv$current_step <- "Failed"
+      rv$status <- "Clipping failed or produced no output."
+      if (!nzchar(rv$error_log)) add_error("No points were clipped for any scan (the inward buffer may be too large).")
+      return()
+    }
+    rv$laz_files <- res
+    set_progress("Done", 1, "Clipping complete. Use the download button for the LAZ files.")
+  })
+  
+  # ---------------------------------------------------------------------------
+  # Outputs
+  # ---------------------------------------------------------------------------
+  fits_tbl <- reactive({
+    req(rv$shapes)
+    inset <- inset_val()
+    rv$shapes %>%
+      transmute(
+        quadrat_id,
+        length_m = round(pmax(size_x, size_y), 4),
+        width_m = round(pmin(size_x, size_y), 4),
+        fitted_length_m = round(pmax(fitted_x, fitted_y), 4),
+        fitted_width_m = round(pmin(fitted_x, fitted_y), 4),
+        angle_deg = round(angle * 180 / pi, 2),
+        error_pct = round(error_pct, 2), votes,
+        clip_length_m = round(pmax(pmax(size_x, size_y) - 2 * inset, 0), 4),
+        clip_width_m = round(pmax(pmin(size_x, size_y) - 2 * inset, 0), 4)
+      )
+  })
+  output$quadrat_fits_table <- renderTable(fits_tbl(), rownames = FALSE)
+  
+  output$quadrat_plot <- renderPlot({
+    shapes_df <- rv$shapes
+    pts <- rv$pts
+    req(shapes_df, pts)
+    inset <- inset_val()
+    
+    zoom <- input$zoom_quad
+    xlim <- range(pts$X); ylim <- range(pts$Y)
+    if (!is.null(zoom) && zoom != "All" && zoom %in% shapes_df$quadrat_id) {
+      cr <- shapes_df$corners[[which(shapes_df$quadrat_id == zoom)]]
+      xlim <- range(cr[, 1]) + c(-0.3, 0.3)
+      ylim <- range(cr[, 2]) + c(-0.3, 0.3)
+      pts <- pts[pts$X >= xlim[1] & pts$X <= xlim[2] & pts$Y >= ylim[1] & pts$Y <= ylim[2], ]
+    }
+    plot(pts$X, pts$Y, pch = 16, cex = 0.3, col = grDevices::adjustcolor("grey30", 0.5),
+         asp = 1, xlim = xlim, ylim = ylim, xlab = "X", ylab = "Y",
+         main = sprintf("Fitted frames (blue) and clip boundary (red, inward buffer = %.3f m)", inset))
+    for (i in seq_len(nrow(shapes_df))) {
+      p <- shapes_df$corners[[i]][, 1:2, drop = FALSE]
+      p <- rbind(p, p[1, , drop = FALSE])
+      lines(p[, 1], p[, 2], col = "blue", lwd = 2)
+      text(mean(p[1:4, 1]), mean(p[1:4, 2]),
+           sprintf("%s (%.2f x %.2f m)", shapes_df$quadrat_id[i],
+                   max(shapes_df$size_x[i], shapes_df$size_y[i]),
+                   min(shapes_df$size_x[i], shapes_df$size_y[i])),
+           pos = 3, cex = 0.8)
+      # clip boundary: frame pulled inward by the buffer, in the plane frame
+      sx <- shapes_df$size_x[i] - 2 * inset
+      sy <- shapes_df$size_y[i] - 2 * inset
+      if (sx > 0 && sy > 0) {
+        c_rot <- rotated_rect_corners(shapes_df$sq_center[[i]], sx, sy, shapes_df$angle[i])
+        c_orig <- cbind(c_rot, shapes_df$z_level[i]) %*% t(shapes_df$V[[i]])
+        c_orig <- sweep(c_orig, 2, shapes_df$center3[[i]], "+")
+        cp <- rbind(c_orig[, 1:2, drop = FALSE], c_orig[1, 1:2, drop = FALSE])
+        lines(cp[, 1], cp[, 2], col = "red", lwd = 2, lty = 2)
+      }
+    }
+  })
+  
+  # Only the LAZ download is offered (no CSV)
+  output$download_ui <- renderUI({
+    if (length(rv$laz_files) > 0) downloadButton("download_laz", "Download Clipped LAZ (.zip)")
+  })
+  
+  output$download_laz <- downloadHandler(
+    filename = function() paste0(rv$mls_name, "_quadrats.zip"),
+    content = function(file) {
+      req(length(rv$laz_files) > 0)
+      f <- rv$laz_files
+      if (requireNamespace("zip", quietly = TRUE)) {
+        zip::zipr(file, basename(f), root = dirname(f[1]))
+      } else {
+        utils::zip(file, f, flags = "-j")
+      }
+    }
+  )
+}
+
+shinyApp(ui = ui, server = server)
