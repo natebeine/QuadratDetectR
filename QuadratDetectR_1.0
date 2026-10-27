@@ -1,34 +1,24 @@
-# detect_quadrats_fixed_v3.R
+# QuadratDetectR.R
 # Detect quadrat frames in intensity-filtered MLS, fit oriented squares, and clip TLS + MLS.
 #
-# Changes in v3:
-#   - Height clip: only points up to `clip_max_height` (default 1.37 m) ABOVE each fitted
-#     square are kept. Height is measured PERPENDICULAR to the fitted plane (not straight up
-#     in Z), so tilted frames get a tilted clip prism. `clip_min_height` sets the lower limit.
-#
-# Changes in v2:
-#   - Clipping is now INSIDE each fitted square: the clip edge is pulled inward by
-#     `clip_inset` (default 0.005 m) so the frame itself is excluded. Adjust as needed.
-#   - Clipped LAZ files are written to the "automatically_clip" folder.
-#   - site_id is taken from the TLS file name (no more CHT_17 / CHT_37 mismatch).
-#
-# Earlier changes (v1):
-#   1. Orientation/size come from a MIN-AREA ROTATED RECTANGLE (PCA is arbitrary for squares).
-#   2. Outlier points are trimmed inside each component BEFORE fitting.
-#   3. Optional known quadrat size (quadrat_size) fixes the size instead of fitting it.
-#   4. Size is never inflated; optional robust trimming instead.
-#   5. Clipping honours the fitted angle (rotated square), in the plane frame or in plain XY.
+# Workflow:
+#   1) Filter the MLS by intensity and find candidate frames (connected components).
+#   2) Fit a min-area rotated rectangle to each candidate (in its best-fit plane if tilt_clip = TRUE).
+#   3) Clip the TLS and MLS to the INSIDE of each fitted square, pulled inward by `clip_inset`
+#      so the frame itself is excluded. Only points up to `clip_max_height` above each fitted
+#      square are kept; height is measured perpendicular to the fitted plane, so tilted frames
+#      get a tilted clip prism.
+#   4) Write the clipped points to LAZ files and the fit parameters to a CSV.
 
 library(lidR)
 library(tidyverse)
 library(rgl)
 
 # ---- User paths (edit) -----------------------------------------------------
-tls_path   <- "Q:/ABOR/Student_projects/Beine_Understory_Processing/TLS/ABOR_Kaibab_CHT_37_25_registered.laz"
-mls_path   <- "Q:/ABOR/Student_projects/Beine_Understory_Processing/MLS/ABOR_Kaibab_CHT_37_25_MLS.laz"
-out_folder <- "Q:/ABOR/Student_projects/Beine_Understory_Processing/automatically_clip"
-site_id    <- stringr::str_extract(basename(tls_path), "CHT_\\d+")   # e.g. "CHT_37"
-if (is.na(site_id)) site_id <- "site"
+tls_path   <- "path to your TLS file"
+mls_path   <- "path to your MLS file"
+out_folder <- "path to your output folder"
+site_id    <- tools::file_path_sans_ext(basename(tls_path))   # used to name output files
 dir.create(out_folder, recursive = TRUE, showWarnings = FALSE)
 
 # ---- Mode ------------------------------------------------------------------
@@ -47,7 +37,7 @@ error_pct_max     <- 10     # mean distance of points to nearest edge, as % of s
 mad_k             <- 3      # outlier cutoff (MADs of distance from component centre)
 trim_prob         <- 0.01   # robust box: ignore the most extreme 1% on each side (0 = off)
 angle_step_deg    <- 0.5
-clip_inset        <- 0.02  # metres the clip is pulled INSIDE each square edge (adjustable;
+clip_inset        <- 0.04   # metres the clip is pulled INSIDE each square edge (adjustable;
 #   set 0 to clip exactly on the square, negative to expand outward)
 clip_max_height   <- 1.37   # m ABOVE the fitted square, measured perpendicular to its plane
 clip_min_height   <- -Inf   # m below the fitted square (negative number, e.g. -0.1); -Inf = no limit
