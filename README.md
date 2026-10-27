@@ -10,7 +10,7 @@ This workflow was developed using data from piñon-juniper woodland plots sample
 
 1. **Load the LiDAR point cloud**
 
-   The script reads in an MLS point cloud containing the surveyed ground surface and any reflective quadrat markers. It can optionally also extract points from a TLS point cloud that is properly aligned spatially with the MLS point cloud.
+   The script reads in an MLS point cloud from a forest plot where reflective tape wrapped quadrats were deployed prior to the scan. It can optionally also extract points from a TLS point cloud that is properly aligned spatially with the MLS point cloud.
 
    ![Original LiDAR point cloud containing the quadrats](QuadratDetectR_point_cloud.jpg)
 
@@ -34,11 +34,11 @@ This workflow was developed using data from piñon-juniper woodland plots sample
 
 5. **Check the fitted quadrats**
 
-   The fitted squares can be inspected to confirm that they align with the reflective tape and represent the intended 1 m² quadrats. This step is useful for identifying false detections, overlapping quadrats, or poor-quality fits.
+   The fitted squares can be inspected to confirm that they align with the reflective tape and represent the intended 1 m² quadrats. Quadrat size and intensity parameters may need to be adjusted to ensure effective square fitting.
 
 6. **Extract points within each quadrat**
 
-   Once the quadrat boundaries have been identified, the script selects the LiDAR points inside each 1 m² square. These extracted points can then be saved or used for downstream analyses of vegetation structure and composition.
+   Once the quadrat boundaries have been identified, the script extracts the LiDAR points inside each 1 m² square up to a set height threshold (here 1.37 m). The extracted quadrat points can be used to predict desired metrics such as vegetation biomass and cover. This script exports raw points clouds, further processing may be needed for effective analysis. 
 
    ![MLS point cloud showing extracted quadrats](QuadratDetecrR_MLS_quads.jpg)
 
