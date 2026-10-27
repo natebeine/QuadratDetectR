@@ -44,4 +44,4 @@ This workflow was developed using data from piñon-juniper woodland plots sample
 
    *MLS point cloud showing the extracted quadrats.*
 
-An R Shinyapp is also presented here ([`QuadratDetectR_app`](https://github.com/nate to simplify the process for those unfamiliar with working in R. This app is available online as well (https://natebeine.shinyapps.io/QuadratDetectR/) thought this version crashes for larger laz files. 
+An R Shinyapp is also presented here ([QuadratDetectR_app](https://github.com/natebeine/QuadratDetectR/blob/main/QuadratDetectR_app)) to simplify the process for those unfamiliar with working in R. This app is [available online as well](https://natebeine.shinyapps.io/QuadratDetectR/), though this version crashes for larger LAZ files.
