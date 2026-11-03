@@ -28,16 +28,16 @@ axis_bbox  <- FALSE   # only used when tilt_clip = FALSE: TRUE = axis-aligned bb
 # ---- Tuning ----------------------------------------------------------------
 quadrat_size      <- NULL   # OUTER side length of the frame in metres (e.g. 0.5 or 1). NULL = fit it.
 size_tol          <- 0.25   # accepted fractional deviation from quadrat_size (0.25 = +/-25%)
-intensity_cut     <- 30000
-conn_res          <- 0.1
-conn_min_pts      <- 5
-min_pts_component <- 30
+intensity_cut     <- 30000   # minimum MLS point intensity used to detect frame candidates
+conn_res          <- 0.1     # XY connection distance in metres for grouping filtered points
+conn_min_pts      <- 5       # minimum points required for a connected component
+min_pts_component <- 30      # minimum points required before fitting a component
 aspect_tol        <- 0.20   # |w - h| <= aspect_tol * size
 error_pct_max     <- 10     # mean distance of points to nearest edge, as % of size
-mad_k             <- 3      # outlier cutoff (MADs of distance from component centre)
+mad_k             <- 3       # outlier cutoff (mean absolute deviation (MADs) of distance from component center)
 trim_prob         <- 0.01   # robust box: ignore the most extreme 1% on each side (0 = off)
-angle_step_deg    <- 0.5
-clip_inset        <- 0.04   # metres the clip is pulled INSIDE each square edge (adjustable;
+angle_step_deg    <- 0.5     # angular step in degrees used when searching rectangle orientations
+clip_inset        <- 0.05   # metres the clip is pulled INSIDE each square edge (adjustable;
 #   set 0 to clip exactly on the square, negative to expand outward)
 clip_max_height   <- 1.37   # m ABOVE the fitted square, measured perpendicular to its plane
 clip_min_height   <- -Inf   # m below the fitted square (negative number, e.g. -0.1); -Inf = no limit
@@ -66,7 +66,7 @@ plane_frame <- function(xyz, use_plane = TRUE) {
   list(V = V, center3 = center3, rot = Xc %*% V)
 }
 
-# Min-area rotated rectangle. Returns centre (in input frame), angle (rad), w, h, size.
+# Min-area rotated rectangle. Returns center (in input frame), angle (rad), w, h, size.
 fit_square_minarea <- function(xy, angle_step_deg = 0.5, trim_prob = 0) {
   xy <- as.matrix(xy)
   angles <- seq(0, 90 - angle_step_deg, by = angle_step_deg) * pi / 180
@@ -166,7 +166,7 @@ for (cid in unique(df$Component)) {
   fr <- plane_frame(comp[, c("X", "Y", "Z")], use_plane = tilt_clip)
   rxy <- fr$rot[, 1:2, drop = FALSE]
   
-  # 1) Outlier trimming: distance from robust centre
+  # 1) Outlier trimming: distance from robust center
   cen0 <- apply(rxy, 2, median)
   d <- sqrt(rowSums(sweep(rxy, 2, cen0)^2))
   keep <- d <= median(d) + mad_k * mad(d)
